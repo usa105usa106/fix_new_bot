@@ -2,6 +2,8 @@ import os
 import re
 import time
 import tempfile
+import textwrap
+import html as html_lib
 from pathlib import Path
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -19,7 +21,7 @@ import matplotlib.dates as mdates
 from matplotlib.patches import Rectangle
 
 
-VERSION = "0.1"
+VERSION = "0.2"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -41,6 +43,13 @@ EXCHANGE_ID = "mexc"
 EXCHANGE_DEFAULT_TYPE = "swap"
 TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d", "1w", "1M"]
 
+VISUALIZATION_MODES = {
+    "auto": "Авто: картинка + текст, если не уместилось",
+    "chart_top": "График сверху, текст снизу",
+    "text_top": "Текст сверху, график снизу",
+    "image_all": "Всё в одной картинке",
+}
+
 DEFAULT_STATE = {
     "coins": ["BTC", "ETH", "SOL", "ADA", "XAU", "XAG", "TSLA", "NVDA", "XRP", "BCH", "TON"],
     "main_timeframe": "1h",
@@ -50,6 +59,7 @@ DEFAULT_STATE = {
     "america_enabled": False,
     "exchange_type": "swap",
     "chart_enabled": True,
+    "visualization_mode": "auto",
 }
 
 CANDLE_LIMIT = 260
@@ -131,6 +141,8 @@ def load_state() -> Dict:
     merged["position_size_pct"] = max(0.1, min(100.0, float(merged.get("position_size_pct", DEFAULT_STATE["position_size_pct"]))))
     merged["exchange_type"] = merged.get("exchange_type") if merged.get("exchange_type") in ("swap", "spot") else "swap"
     merged["chart_enabled"] = bool(merged.get("chart_enabled", True))
+    if merged.get("visualization_mode") not in VISUALIZATION_MODES:
+        merged["visualization_mode"] = DEFAULT_STATE["visualization_mode"]
 
     return merged
 
@@ -174,6 +186,7 @@ def keyboard() -> types.ReplyKeyboardMarkup:
     america = "🟢 Америка" if st["america_enabled"] else "⚪️ Америка"
     kb.row(asia, america)
 
+    kb.row("🖼 Визуализация")
     kb.row("🏓 Ping", "♻️ Сброс")
     return kb
 
@@ -207,9 +220,44 @@ def settings_markup() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton(("✅" if st["exchange_type"] == "swap" else "⚪️") + " Futures", callback_data="market:swap"),
         types.InlineKeyboardButton(("✅" if st["exchange_type"] == "spot" else "⚪️") + " Spot", callback_data="market:spot"),
     )
+    mk.row(types.InlineKeyboardButton("🖼 Визуализация", callback_data="viz:menu"))
     mk.row(types.InlineKeyboardButton("♻️ Сброс настроек", callback_data="reset"))
     return mk
 
+
+
+
+def visualization_markup() -> types.InlineKeyboardMarkup:
+    st = load_state()
+    current = st.get("visualization_mode", "auto")
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    for mode, title in VISUALIZATION_MODES.items():
+        prefix = "✅ " if current == mode else ""
+        mk.add(types.InlineKeyboardButton(prefix + title, callback_data=f"viz:set:{mode}"))
+    mk.add(types.InlineKeyboardButton("⬅️ Назад в настройки", callback_data="settings:back"))
+    return mk
+
+
+def visualization_text() -> str:
+    st = load_state()
+    mode = st.get("visualization_mode", "auto")
+    lines = [
+        "🖼 <b>Визуализация сигнала</b>",
+        "",
+        f"Текущий режим: <b>{html_escape(VISUALIZATION_MODES.get(mode, VISUALIZATION_MODES['auto']))}</b>",
+        f"График: <b>{'ON' if st.get('chart_enabled', True) else 'OFF'}</b>",
+        "",
+        "Выбери, как отправлять полный сигнал:",
+        "✅ График сверху, текст снизу",
+        "✅ Текст сверху, график снизу",
+        "✅ Всё в одной картинке",
+        "✅ Авто: бот пробует одну картинку; если не уместилось — отправляет график и текст отдельно",
+    ]
+    return "\n".join(lines)
+
+
+def visualization_short_label(state: Dict) -> str:
+    return VISUALIZATION_MODES.get(state.get("visualization_mode", "auto"), VISUALIZATION_MODES["auto"])
 
 def get_exchange():
     global _exchange, _markets
@@ -266,8 +314,71 @@ def resolve_symbol(coin: str) -> str:
     )
 
 
+def aggregate_weekly_to_monthly(weekly: List[List[float]]) -> List[List[float]]:
+    """Build synthetic 1M candles from 1w candles.
+
+    MEXC may not return native 1M candles for many swap markets.
+    This fallback keeps the monthly timeframe useful as a high-timeframe trend filter.
+    """
+    if not weekly:
+        return []
+
+    buckets = {}
+    order = []
+
+    for c in weekly:
+        ts = int(c[0])
+        dt = datetime.utcfromtimestamp(ts / 1000)
+        key = (dt.year, dt.month)
+
+        if key not in buckets:
+            buckets[key] = {
+                "ts": ts,
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5]),
+            }
+            order.append(key)
+        else:
+            b = buckets[key]
+            b["high"] = max(b["high"], float(c[2]))
+            b["low"] = min(b["low"], float(c[3]))
+            b["close"] = float(c[4])
+            b["volume"] += float(c[5])
+
+    out = []
+    for key in order:
+        b = buckets[key]
+        out.append([b["ts"], b["open"], b["high"], b["low"], b["close"], b["volume"]])
+
+    return out
+
+
 def fetch_ohlcv(symbol: str, timeframe: str) -> List[List[float]]:
     ex = get_exchange()
+
+    if timeframe == "1M":
+        # First try native monthly candles.
+        try:
+            candles = ex.fetch_ohlcv(symbol, timeframe="1M", limit=CANDLE_LIMIT)
+            if len(candles) >= 24:
+                return candles
+        except Exception:
+            candles = []
+
+        # Fallback: synthetic monthly candles from weekly data.
+        weekly = ex.fetch_ohlcv(symbol, timeframe="1w", limit=CANDLE_LIMIT)
+        monthly = aggregate_weekly_to_monthly(weekly)
+
+        if len(monthly) >= 12:
+            return monthly[-CANDLE_LIMIT:]
+
+        # If even weekly history is short, return native result if available
+        # so the caller can show a clear "not enough data" message.
+        return candles
+
     return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=CANDLE_LIMIT)
 
 
@@ -519,8 +630,10 @@ def backtest_winrate(high: List[float], low: List[float], close: List[float], vo
 
 def analyze_timeframe(symbol: str, timeframe: str) -> Dict:
     candles = fetch_ohlcv(symbol, timeframe)
-    if len(candles) < 80:
-        raise RuntimeError(f"Мало свечей для {symbol} {timeframe}: {len(candles)}")
+
+    min_candles = 24 if timeframe == "1M" else 80
+    if len(candles) < min_candles:
+        raise RuntimeError(f"Мало свечей для {symbol} {timeframe}: {len(candles)} / нужно {min_candles}")
 
     high = [float(c[2]) for c in candles]
     low = [float(c[3]) for c in candles]
@@ -715,7 +828,10 @@ def timeframe_success_line(r: Dict, main_tf: Optional[str] = None) -> str:
 
     if win is None:
         success = model
-        extra = f"модель {model}%"
+        if tf == "1M":
+            extra = f"тренд-модель {model}%"
+        else:
+            extra = f"модель {model}%"
     else:
         success = win
         extra = f"отработка TP1 {win}% / {trades} сделок, модель {model}%"
@@ -779,6 +895,57 @@ def format_signal(sig: Dict) -> str:
     return "\n".join(lines)
 
 
+def draw_signal_chart_axes(ax, axv, sig: Dict, candles: List[List[float]]) -> bool:
+    if len(candles) < 10:
+        return False
+
+    times = [datetime.fromtimestamp(c[0] / 1000) for c in candles]
+    dates = mdates.date2num(times)
+    opens = [float(c[1]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    vols = [float(c[5]) for c in candles]
+
+    width = (dates[1] - dates[0]) * 0.7 if len(dates) > 1 else 0.03
+
+    for d, o, h, l, c in zip(dates, opens, highs, lows, closes):
+        color = "#12a77b" if c >= o else "#e55353"
+        ax.plot([d, d], [l, h], color=color, linewidth=1)
+        lower = min(o, c)
+        height = max(abs(c - o), max(closes) * 0.000001)
+        ax.add_patch(Rectangle((d - width / 2, lower), width, height, facecolor=color, edgecolor=color, linewidth=0.8))
+
+    vmax = max(vols) if vols else 1
+    for d, v, o, c in zip(dates, vols, opens, closes):
+        color = "#12a77b" if c >= o else "#e55353"
+        axv.bar(d, v, width=width, color=color, alpha=0.45)
+    axv.set_ylim(0, vmax * 1.25)
+
+    entry = sig.get("entry")
+    stop = sig.get("stop")
+    targets = sig.get("targets") or []
+
+    def hline(y, label, color):
+        ax.axhline(y, linestyle="--", linewidth=1.3, color=color)
+        ax.text(dates[-1], y, f" {label} {fmt_price(y)} ", va="center", ha="left", fontsize=9, color="white",
+                bbox=dict(facecolor=color, edgecolor=color, boxstyle="round,pad=0.25"))
+
+    if entry:
+        hline(entry, "ENTRY", "#3b82f6")
+    if stop:
+        hline(stop, "SL", "#ef4444")
+    for idx, t in enumerate(targets, start=1):
+        hline(t, f"TP{idx}", "#22c55e")
+
+    title = f"{sig['coin']}/USDT | {side_text(sig['side'])} | TF {sig['state']['main_timeframe']} | Total {sig['total_success']}%"
+    ax.set_title(title, fontsize=13)
+    ax.grid(True, alpha=0.25)
+    axv.grid(True, alpha=0.20)
+    axv.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    return True
+
+
 def create_chart(sig: Dict) -> Optional[str]:
     if not sig["state"].get("chart_enabled", True):
         return None
@@ -788,55 +955,14 @@ def create_chart(sig: Dict) -> Optional[str]:
         if len(candles) < 10:
             return None
 
-        times = [datetime.fromtimestamp(c[0] / 1000) for c in candles]
-        dates = mdates.date2num(times)
-        opens = [float(c[1]) for c in candles]
-        highs = [float(c[2]) for c in candles]
-        lows = [float(c[3]) for c in candles]
-        closes = [float(c[4]) for c in candles]
-        vols = [float(c[5]) for c in candles]
-
         fig, (ax, axv) = plt.subplots(
             2, 1, figsize=(10, 6), sharex=True,
             gridspec_kw={"height_ratios": [4, 1]}
         )
-
-        width = (dates[1] - dates[0]) * 0.7 if len(dates) > 1 else 0.03
-
-        for d, o, h, l, c in zip(dates, opens, highs, lows, closes):
-            color = "#12a77b" if c >= o else "#e55353"
-            ax.plot([d, d], [l, h], color=color, linewidth=1)
-            lower = min(o, c)
-            height = max(abs(c - o), max(closes) * 0.000001)
-            ax.add_patch(Rectangle((d - width / 2, lower), width, height, facecolor=color, edgecolor=color, linewidth=0.8))
-
-        vmax = max(vols) if vols else 1
-        for d, v, o, c in zip(dates, vols, opens, closes):
-            color = "#12a77b" if c >= o else "#e55353"
-            axv.bar(d, v, width=width, color=color, alpha=0.45)
-        axv.set_ylim(0, vmax * 1.25)
-
-        entry = sig.get("entry")
-        stop = sig.get("stop")
-        targets = sig.get("targets") or []
-
-        def hline(y, label, color):
-            ax.axhline(y, linestyle="--", linewidth=1.3, color=color)
-            ax.text(dates[-1], y, f" {label} {fmt_price(y)} ", va="center", ha="left", fontsize=9, color="white",
-                    bbox=dict(facecolor=color, edgecolor=color, boxstyle="round,pad=0.25"))
-
-        if entry:
-            hline(entry, "ENTRY", "#3b82f6")
-        if stop:
-            hline(stop, "SL", "#ef4444")
-        for idx, t in enumerate(targets, start=1):
-            hline(t, f"TP{idx}", "#22c55e")
-
-        title = f"{sig['coin']}/USDT | {side_text(sig['side'])} | TF {sig['state']['main_timeframe']} | Total {sig['total_success']}%"
-        ax.set_title(title, fontsize=13)
-        ax.grid(True, alpha=0.25)
-        axv.grid(True, alpha=0.20)
-        axv.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+        ok = draw_signal_chart_axes(ax, axv, sig, candles)
+        if not ok:
+            plt.close(fig)
+            return None
 
         fig.autofmt_xdate()
         fig.tight_layout()
@@ -847,6 +973,147 @@ def create_chart(sig: Dict) -> Optional[str]:
         return path
     except Exception:
         return None
+
+
+def signal_text_to_plain(text: str) -> str:
+    plain = re.sub(r"</?(b|code|i|u)>", "", text)
+    plain = re.sub(r"<br\s*/?>", "\n", plain)
+    plain = re.sub(r"<[^>]+>", "", plain)
+    return html_lib.unescape(plain)
+
+
+def wrap_plain_signal_text(text: str, width: int = 92) -> List[str]:
+    plain = signal_text_to_plain(text)
+    out = []
+    for line in plain.splitlines():
+        if not line.strip():
+            out.append("")
+            continue
+        wrapped = textwrap.wrap(line, width=width, replace_whitespace=False, drop_whitespace=False)
+        out.extend(wrapped or [line])
+    return out
+
+
+def create_combined_signal_image(sig: Dict, text: str, force: bool = False) -> Optional[str]:
+    if not sig["state"].get("chart_enabled", True):
+        return None
+
+    try:
+        main = sig["main"]
+        candles = main["candles"][-90:]
+        if len(candles) < 10:
+            return None
+
+        lines = wrap_plain_signal_text(text, width=92)
+        max_lines = 95 if force else 58
+        if len(lines) > max_lines:
+            return None
+
+        text_height = max(3.0, min(14.0, 0.205 * len(lines) + 0.8))
+        fig_height = 6.1 + text_height
+        if fig_height > (24 if force else 18):
+            return None
+
+        fig = plt.figure(figsize=(11, fig_height))
+        gs = fig.add_gridspec(3, 1, height_ratios=[4, 1, text_height], hspace=0.10)
+        ax = fig.add_subplot(gs[0])
+        axv = fig.add_subplot(gs[1], sharex=ax)
+        axt = fig.add_subplot(gs[2])
+
+        ok = draw_signal_chart_axes(ax, axv, sig, candles)
+        if not ok:
+            plt.close(fig)
+            return None
+
+        axt.axis("off")
+        plain_block = "\n".join(lines)
+        axt.text(
+            0.01, 0.99, plain_block,
+            va="top", ha="left",
+            fontsize=9.5,
+            fontfamily="DejaVu Sans Mono",
+            linespacing=1.18,
+            transform=axt.transAxes,
+        )
+
+        fig.autofmt_xdate()
+        fig.subplots_adjust(top=0.965, bottom=0.035, left=0.065, right=0.965)
+
+        path = str(Path(tempfile.gettempdir()) / f"signal_full_{sig['coin']}_{int(time.time())}.png")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return path
+    except Exception:
+        return None
+
+
+def safe_delete_message(chat_id, message_id) -> None:
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+def cleanup_file(path: Optional[str]) -> None:
+    if path:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def send_text_parts(chat_id, text: str, first_edit_message=None) -> None:
+    parts = split_text(text)
+    if first_edit_message is not None:
+        bot.edit_message_text(parts[0], chat_id=first_edit_message.chat.id, message_id=first_edit_message.message_id, disable_web_page_preview=True)
+        for part in parts[1:]:
+            bot.send_message(chat_id, part, disable_web_page_preview=True)
+    else:
+        for part in parts:
+            bot.send_message(chat_id, part, disable_web_page_preview=True)
+
+
+def send_signal_visualized(message, wait_msg, sig: Dict, text: str, chart_path: Optional[str]) -> None:
+    mode = sig["state"].get("visualization_mode", "auto")
+    chat_id = message.chat.id
+
+    if mode == "text_top":
+        send_text_parts(chat_id, text, first_edit_message=wait_msg)
+        if chart_path and Path(chart_path).exists():
+            with open(chart_path, "rb") as f:
+                bot.send_photo(chat_id, f, caption=f"📊 {html_escape(sig['coin'])}/USDT — Entry / TP / SL")
+        return
+
+    if mode == "image_all":
+        image_path = create_combined_signal_image(sig, text, force=True)
+        if image_path and Path(image_path).exists():
+            safe_delete_message(wait_msg.chat.id, wait_msg.message_id)
+            with open(image_path, "rb") as f:
+                bot.send_photo(chat_id, f, caption=f"🖼 {html_escape(sig['coin'])}/USDT — полный сигнал")
+            cleanup_file(image_path)
+            return
+        # Надёжный fallback: если одна картинка не построилась, отправляем текст и график отдельно.
+        mode = "chart_top"
+
+    if mode == "auto":
+        image_path = create_combined_signal_image(sig, text, force=False)
+        if image_path and Path(image_path).exists():
+            safe_delete_message(wait_msg.chat.id, wait_msg.message_id)
+            with open(image_path, "rb") as f:
+                bot.send_photo(chat_id, f, caption=f"🖼 {html_escape(sig['coin'])}/USDT — полный сигнал")
+            cleanup_file(image_path)
+            return
+        # Если текст не поместился или картинка неудобная — график отдельной картинкой, текст ниже.
+        mode = "chart_top"
+
+    # chart_top и общий fallback.
+    if chart_path and Path(chart_path).exists():
+        safe_delete_message(wait_msg.chat.id, wait_msg.message_id)
+        with open(chart_path, "rb") as f:
+            bot.send_photo(chat_id, f, caption=f"📊 {html_escape(sig['coin'])}/USDT — Entry / TP / SL")
+        send_text_parts(chat_id, text)
+    else:
+        send_text_parts(chat_id, text, first_edit_message=wait_msg)
 
 
 def split_text(text: str, max_len: int = 3900) -> List[str]:
@@ -879,22 +1146,10 @@ def send_signal(message, coin_text: str):
     try:
         sig = aggregate_signal(coin)
         chart_path = create_chart(sig)
-
-        if chart_path and Path(chart_path).exists():
-            with open(chart_path, "rb") as f:
-                bot.send_photo(message.chat.id, f, caption=f"📊 {html_escape(sig['coin'])}/USDT — Entry / TP / SL")
-
         text = format_signal(sig)
-        parts = split_text(text)
-        bot.edit_message_text(parts[0], chat_id=wait_msg.chat.id, message_id=wait_msg.message_id, disable_web_page_preview=True)
-        for part in parts[1:]:
-            bot.send_message(message.chat.id, part, disable_web_page_preview=True)
 
-        if chart_path:
-            try:
-                Path(chart_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+        send_signal_visualized(message, wait_msg, sig, text, chart_path)
+        cleanup_file(chart_path)
     except Exception as e:
         bot.edit_message_text(
             f"❌ Ошибка сигнала по <b>{html_escape(coin)}</b>\n\n<code>{html_escape(str(e))}</code>",
@@ -963,6 +1218,7 @@ def settings_text() -> str:
 Плечо: <b>{st['leverage']}x</b>
 Размер позиции: <b>{st['position_size_pct']:g}%</b>
 График: <b>{'ON' if st['chart_enabled'] else 'OFF'}</b>
+Визуализация: <b>{html_escape(visualization_short_label(st))}</b>
 
 Монеты:
 <code>{", ".join(st['coins'])}</code>
@@ -974,8 +1230,11 @@ def settings_text() -> str:
 Команды:
 <code>/signal</code> — общий скан
 <code>/signal BTC</code> — полный сигнал
+<code>/viz</code> — режим визуализации
 <code>new pol</code> — добавить POL
 <code>exit sol</code> — удалить SOL
+
+1M используется как старший тренд-фильтр. Если MEXC не отдаёт месячные свечи, бот собирает 1M из недельных свечей.
 
 Все настройки, кроме <code>BOT_TOKEN</code> и <code>ALLOWED_USER_IDS</code>, меняются здесь.
 """
@@ -1033,6 +1292,7 @@ def cmd_start(message):
         "<code>new pol</code> — добавить монету\n"
         "<code>exit sol</code> — удалить монету\n"
         "<code>/settings</code> — настройки\n"
+        "<code>/viz</code> — режим визуализации\n"
         "<code>/myid</code> — Telegram ID\n\n"
         "⚠️ Это не финансовая рекомендация."
     )
@@ -1051,6 +1311,14 @@ def cmd_settings(message):
         deny(message)
         return
     bot.send_message(message.chat.id, settings_text(), reply_markup=settings_markup())
+
+
+@bot.message_handler(commands=["visualization", "viz"])
+def cmd_visualization(message):
+    if not is_allowed(message):
+        deny(message)
+        return
+    bot.send_message(message.chat.id, visualization_text(), reply_markup=visualization_markup())
 
 
 @bot.message_handler(commands=["signal"])
@@ -1073,6 +1341,26 @@ def callback(call):
     try:
         if data == "noop":
             bot.answer_callback_query(call.id)
+            return
+
+        if data == "viz:menu":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(visualization_text(), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=visualization_markup())
+            return
+
+        if data == "settings:back":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(settings_text(), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=settings_markup())
+            return
+
+        if data.startswith("viz:set:"):
+            mode = data.split(":", 2)[2]
+            if mode in VISUALIZATION_MODES:
+                st["visualization_mode"] = mode
+                st["chart_enabled"] = True
+                save_state(st)
+                bot.answer_callback_query(call.id, VISUALIZATION_MODES[mode])
+            bot.edit_message_text(visualization_text(), chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=visualization_markup())
             return
 
         if data.startswith("tf:"):
@@ -1172,6 +1460,10 @@ def text_handler(message):
 
     if text == "⚙️ Настройки":
         cmd_settings(message)
+        return
+
+    if text == "🖼 Визуализация" or low in ("визуализация", "visualization", "viz", "/viz", "/visualization"):
+        cmd_visualization(message)
         return
 
     if text in ("🏓 Ping", "ping", "/ping"):
